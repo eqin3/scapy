@@ -211,6 +211,12 @@ def _strip_header_name(name):
 def _header_line(name, val):
     """Creates a HTTP header line"""
     # Python 3.4 doesn't support % on bytes
+    if name == 'Set-Cookie':
+        cookies = val.split(b'\r\n')
+        hdrs = b''
+        for cookie in cookies:
+            hdrs += bytes_encode(name) + b": " + bytes_encode(cookie.strip()) + b'\r\n'
+        return hdrs.strip()
     return bytes_encode(name) + b": " + bytes_encode(val)
 
 

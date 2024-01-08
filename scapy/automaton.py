@@ -31,7 +31,7 @@ from scapy.utils import do_graph
 from scapy.error import log_runtime, warning
 from scapy.plist import PacketList
 from scapy.data import MTU
-from scapy.supersocket import SuperSocket
+from scapy.supersocket import SuperSocket, StreamSocket
 from scapy.packet import Packet
 from scapy.consts import WINDOWS
 
@@ -252,6 +252,7 @@ class Message:
     result = None      # type: str
     state = None       # type: Message
     exc_info = None    # type: Union[Tuple[None, None, None], Tuple[BaseException, Exception, types.TracebackType]] # noqa: E501
+    socket = None      # type: socket
 
     def __init__(self, **args):
         # type: (Any) -> None
@@ -603,6 +604,8 @@ class _ATMT_Command:
     ACCEPT = "ACCEPT"
     REPLACE = "REPLACE"
     REJECT = "REJECT"
+    # ADDTCPSOCKET = "ADDTCPSOCKET"
+    # ADDUDPSOCKET = "ADDUDPSOCKET"
 
 
 class _ATMT_supersocket(SuperSocket):
@@ -862,6 +865,9 @@ class Automaton(metaclass=Automaton_metaclass):
         self.cmdout = ObjectPipe[Message]("cmdout")
         self.ioin = {}
         self.ioout = {}
+        self.tcp_listening_sockets = []
+        self.tcp_sockets = []
+        self.udp_sockets = []
         self.packets = PacketList()                 # type: PacketList
         for n in self.__class__.ionames:
             extfd = external_fd.get(n)
@@ -1229,6 +1235,12 @@ class Automaton(metaclass=Automaton_metaclass):
                     fds.append(self.listen_sock)
                 for ioev in self.ioevents[self.state.state]:
                     fds.append(self.ioin[ioev.atmt_ioname])
+                for socket in self.tcp_listening_sockets:
+                    fds.append(socket)
+                for socket in self.tcp_sockets:
+                    fds.append(socket)
+                for socket in self.udp_sockets:
+                    fds.append(socket)
                 while True:
                     time_current = time.time()
                     timers.decrement(time_current - time_previous)
@@ -1253,6 +1265,34 @@ class Automaton(metaclass=Automaton_metaclass):
                                         self._run_condition(rcvcond, pkt, *state_output)  # noqa: E501
                                 else:
                                     self.debug(4, "FILTR: %s" % pkt.summary())  # noqa: E501
+                        elif fd in self.tcp_listening_sockets:
+                            from scapy.supersocket import StreamSocket
+                            # from scapy.packet import Raw
+                            from scapy.layers.http import HTTP
+                            self.debug(3, "Receive TCP income Request.")  # noqa: E501
+                            socket, _ = fd.accept()
+                            ss = StreamSocket(socket, HTTP)
+                            self.tcp_sockets.append(ss)
+                            fds.append(ss)
+                        elif fd in self.tcp_sockets:
+                            from scapy.socket_utils import is_socket_closed
+                            if is_socket_closed(fd):
+                                fd.close()
+                                fds.remove(fd)
+                                self.tcp_sockets.remove(fd)
+                            else:
+                                time.sleep(0.05)
+                                pkt = fd.recv(65535)
+                                if pkt is not None:
+                                    self.debug(3, "TCP SVR RECVD: %s" % pkt)  # noqa: E501
+                                    for rcvcond in self.recv_conditions[self.state.state]:  # noqa: E501
+                                        self._run_condition(rcvcond, pkt, fd, *state_output)  # noqa: E501
+                        elif fd in self.udp_sockets:
+                            pkt = fd.recv(65535)
+                            if pkt is not None:
+                                self.debug(3, "UDP SVR RECVD: %s" % pkt)  # noqa: E501
+                                for rcvcond in self.recv_conditions[self.state.state]:  # noqa: E501
+                                    self._run_condition(rcvcond, pkt, *state_output)  # noqa: E501
                         else:
                             self.debug(3, "IOEVENT on %s" % fd.ioname)
                             for ioevt in self.ioevents[self.state.state]:
@@ -1260,6 +1300,7 @@ class Automaton(metaclass=Automaton_metaclass):
                                     self._run_condition(ioevt, fd, *state_output)  # noqa: E501
 
             except ATMT.NewStateRequested as state_req:
+                print('#-->', "switching from [%s] to [%s]" % (self.state.state, state_req.state))
                 self.debug(2, "switching from [%s] to [%s]" % (self.state.state, state_req.state))  # noqa: E501
                 self.state = state_req
                 yield state_req
@@ -1307,6 +1348,29 @@ class Automaton(metaclass=Automaton_metaclass):
         # Start the control thread
         self._do_start(*args, **kargs)
 
+    def add_listen_socket(self, port, ip_ver='dualstack'):
+        skt = socket.create_server(("", port), family=socket.AF_INET6, dualstack_ipv6=True)
+        # af_inet = socket.AF_INET if ip_ver == 4 else socket.AF_INET6
+        # skt = socket.socket(family=af_inet, type=socket.SOCK_STREAM, proto=0)
+        # skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # skt.bind(("", port))
+        skt.listen(10)
+        self.tcp_listening_sockets.append(skt)
+
+    def add_socket(self, ip_addr=None, port=None, type='TCP', basecls=None):
+        if type == 'TCP':
+            import ipaddress
+            ip_ver = ipaddress.ip_address(ip_addr).version
+            af_inet = socket.AF_INET if ip_ver == 4 else socket.AF_INET6
+            skt = socket.socket(af_inet, socket.SOCK_STREAM)
+            skt.connect((ip_addr, port))
+            ss = StreamSocket(skt, basecls)
+            self.tcp_sockets.append(ss)
+            return ss
+        else:
+            raise RuntimeError(f"Don't support {type} now")
+            # self.udp_sockets.append(socket)
+
     def run(self,
             resume=None,    # type: Optional[Message]
             wait=True       # type: Optional[bool]
@@ -1324,6 +1388,7 @@ class Automaton(metaclass=Automaton_metaclass):
                 self.cmdin.send(Message(type=_ATMT_Command.FREEZE))
                 return None
             if c.type == _ATMT_Command.END:
+                self.close_listen_sockets()
                 return c.result
             elif c.type == _ATMT_Command.INTERCEPT:
                 raise self.InterceptionPoint("packet intercepted", state=c.state.state, packet=c.pkt)  # noqa: E501
@@ -1339,6 +1404,10 @@ class Automaton(metaclass=Automaton_metaclass):
                     raise value.with_traceback(c.exc_info[2])
                 raise value
         return None
+
+    def close_listen_sockets(self):
+        for socket in self.tcp_listening_sockets:
+            socket.close()
 
     def runbg(self, resume=None, wait=False):
         # type: (Optional[Message], Optional[bool]) -> None

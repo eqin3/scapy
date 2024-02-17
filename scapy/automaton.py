@@ -1071,8 +1071,10 @@ class Automaton(metaclass=Automaton_metaclass):
 
     def __del__(self):
         # type: () -> None
-        self.stop()
-        self.destroy()
+        # comment the below two lines by ethan
+        # self.stop()
+        # self.destroy()
+        pass
 
     def _run_condition(self, cond, *args, **kargs):
         # type: (_StateWrapper, Any, Any) -> None
